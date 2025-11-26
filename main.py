@@ -365,15 +365,14 @@ def plot_season(season_df: pd.DataFrame, window:Optional[int]=10):
 # ════════════════════════════════════════════════════════════════════════════
 # 12. CLI ENTRY-POINT
 # ════════════════════════════════════════════════════════════════════════════
-
 def main():
-    ap=argparse.ArgumentParser(
+    ap = argparse.ArgumentParser(
         description=f"{SEASON_NAME} ({SEASON_CODE}) ML & diagnostics pipeline"
     )
     ap.add_argument("--audit-missing", action="store_true",
                 help=f"List years with 1 or 2 missing {SEASON_CODE} months")
     ap.add_argument("--start",type=int,default=1981)
-    ap.add_argument("--end",  type=int,default=2024)
+    ap.add_argument("--end",  type=int,default=2024)  
     ap.add_argument("--bbox", nargs=4,type=float,help="S N W E")
     ap.add_argument("--run-all",action="store_true")
     ap.add_argument("--redownload",action="store_true")
@@ -385,30 +384,45 @@ def main():
     ap.add_argument("--plot-only",      action="store_true",
                     help="Just refresh the OND season_totals plot")
     
-    args=ap.parse_args()
-
+    args = ap.parse_args()
     bbox = tuple(args.bbox) if args.bbox else DEF_BBOX
 
+    # 1) Download (only when requested)
     if args.download_only or args.run_all:
-        download_year_range(args.start,args.end,bbox,
+        download_year_range(args.start, args.end, bbox,
                             force=args.redownload)
 
-    # Main preprocessing
+    # 2) Build seasonal series
     season = preprocess(bbox)
-    drv = fetch_climate_drivers()
-    season = season.merge(drv,on="year",how="left")
-    
-    season['nino34_L1'] = season['nino34'].shift(1)
-    season['dmi_L1']    = season['dmi'].shift(1)
-    corr = season[["total_mm","nino34","dmi"]].corr().loc[["nino34","dmi"],
-                                                          "total_mm"]
-    
-    print(f"Lag-0 correlations with {SEASON_CODE} total "
-          f"({season.year.min()}–{season.year.max()}*)")
-    print(corr.round(2))
 
-    season.to_csv(PROC_DIR/f"{SEASON_CODE.lower()}_season_totals_with_drivers.csv",
-                  index=False)
+    # 3) Try to add climate drivers, but soft-skip if files missing
+    nino_file = Path("data/raw/nino34.long.anom.csv")
+    dmi_file  = Path("data/raw/dmi.had.long.csv")
+
+    if nino_file.exists() and dmi_file.exists():
+        drv = fetch_climate_drivers(nino_file, dmi_file)
+        season = season.merge(drv, on="year", how="left")
+
+        season['nino34_L1'] = season['nino34'].shift(1)
+        season['dmi_L1']    = season['dmi'].shift(1)
+
+        corr = (
+            season[["total_mm", "nino34", "dmi"]]
+            .corr()
+            .loc[["nino34", "dmi"], "total_mm"]
+        )
+
+        print(f"Lag-0 correlations with {SEASON_CODE} total "
+              f"({season.year.min()}–{season.year.max()}*)")
+        print(corr.round(2))
+    else:
+        print("⚠️ ENSO/IOD driver CSVs not found – skipping teleconnection "
+              "diagnostics (nino34 / DMI).")
+
+    season.to_csv(
+        PROC_DIR / f"{SEASON_CODE.lower()}_season_totals_with_drivers.csv",
+        index=False
+    )
 
     if args.audit_missing:
         audit_missing_season()
@@ -428,5 +442,5 @@ def main():
 
     trend_test(season)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
