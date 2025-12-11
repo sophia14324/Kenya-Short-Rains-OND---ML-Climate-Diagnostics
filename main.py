@@ -33,18 +33,31 @@ CLIM_REF_START = 1991                    # climatological baseline period
 CLIM_REF_END   = 2020
 
 # ════════════════════════════════════════════════════════════════════════════
-# 1. ENSO / IOD drivers 
+# 1. Constants / paths
 # ════════════════════════════════════════════════════════════════════════════
 
+DEF_BBOX   = (-4.62, 4.62, 33.5, 41.9)          # S, N, W, E (Kenya)
+DATA_DIR   = Path("data/raw");      DATA_DIR.mkdir(parents=True, exist_ok=True)
+PROC_DIR   = Path("data/processed");PROC_DIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR    = Path("outputs");       OUT_DIR .mkdir(parents=True, exist_ok=True)
+
+MONTH_FILE = DATA_DIR / f"chirps_{SEASON_CODE.lower()}.csv"   # OND monthly 0.05°
+
+URL_MONTH = ("https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/africa/"
+             "tifs/chirps-v3.0.{year}.{month:02d}.tif")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. ENSO / IOD drivers 
+# ════════════════════════════════════════════════════════════════════════════
 def fetch_climate_drivers(
-        nino_path: Path = Path("data/raw/nino34.long.anom.csv"),
-        dmi_path : Path = Path("data/raw/dmi.had.long.csv"),
+        nino_path: Path = DATA_DIR / "nino34.long.anom.csv",
+        dmi_path : Path = DATA_DIR / "dmi.had.long.csv",
 ) -> pd.DataFrame:
     """
-    Return DataFrame [year, nino34, dmi] – OND seasonal means.
+    Return DataFrame [year, nino34, dmi, nino34_AS, dmi_AS].
 
-    Assumes monthly values in the PSL-style files. We resample to
-    “AS-OCT” so each ‘year’ corresponds to OND of that year.
+    - nino34, dmi: OND seasonal means (Oct–Dec of that year)
+    - nino34_AS, dmi_AS: Aug–Sep means of the same year (lead for OND)
     """
     def _load(csv: Path, name: str, miss_flag: float) -> pd.Series:
         if not csv.exists():
@@ -57,28 +70,31 @@ def fetch_climate_drivers(
         df.name = name
         return df
 
+    # Monthly indices
     n34 = _load(nino_path, "nino34", -99.99)
     dmi = _load(dmi_path , "dmi"   , -9999)
+    mon = pd.concat([n34, dmi], axis=1)
 
-    # OND seasonal means aligned to the OND season of each year.
-    drv = (pd.concat([n34, dmi], axis=1)
-             .resample(SEASON_FREQ).mean())
-    drv.index = drv.index.year
-    return drv.reset_index(names="year")
+    # 1) OND seasonal means (Oct–Dec of same calendar year)
+    ond = (mon.resample(SEASON_FREQ).mean())      # SEASON_FREQ = "AS-OCT"
+    ond.index = ond.index.year                    # -> 1981, 1982, ...
+    ond.index.name = "year"
 
-# ════════════════════════════════════════════════════════════════════════════
-# 2. Constants / paths
-# ════════════════════════════════════════════════════════════════════════════
+    # 2) Aug–Sep means (same calendar year as OND)
+    mdf = mon.copy()
+    mdf["year"]  = mdf.index.year
+    mdf["month"] = mdf.index.month
 
-DEF_BBOX   = (-4.62, 4.62, 33.5, 41.9)          # S, N, W, E (Kenya)
-DATA_DIR   = Path("data/raw");      DATA_DIR.mkdir(parents=True, exist_ok=True)
-PROC_DIR   = Path("data/processed");PROC_DIR.mkdir(parents=True, exist_ok=True)
-OUT_DIR    = Path("outputs");       OUT_DIR .mkdir(parents=True, exist_ok=True)
+    aug_sep = (mdf[mdf["month"].isin([8, 9])]
+               .groupby("year")[["nino34", "dmi"]]
+               .mean()
+               .add_suffix("_AS"))
 
-MONTH_FILE = DATA_DIR / f"chirps_{SEASON_CODE.lower()}.csv"   # OND monthly 0.05°
+    # Join OND + Aug–Sep on year
+    drv = ond.join(aug_sep, how="left")
 
-URL_MONTH = ("https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/africa/"
-             "tifs/chirps-v3.0.{year}.{month:02d}.tif")
+    return drv.reset_index()  # columns: year, nino34, dmi, nino34_AS, dmi_AS
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 3. CHIRPS helpers
@@ -370,12 +386,13 @@ def main():
         description=f"{SEASON_NAME} ({SEASON_CODE}) ML & diagnostics pipeline"
     )
     ap.add_argument("--audit-missing", action="store_true",
-                help=f"List years with 1 or 2 missing {SEASON_CODE} months")
-    ap.add_argument("--start",type=int,default=1981)
-    ap.add_argument("--end",  type=int,default=2024)  
-    ap.add_argument("--bbox", nargs=4,type=float,help="S N W E")
-    ap.add_argument("--run-all",action="store_true")
-    ap.add_argument("--redownload",action="store_true")
+                    help=f"List years with 1 or 2 missing {SEASON_CODE} months")
+    ap.add_argument("--start", type=int, default=1981)
+    ap.add_argument("--end",   type=int, default=2024)
+    ap.add_argument("--bbox",  nargs=4, type=float, help="S N W E")
+
+    ap.add_argument("--run-all",        action="store_true")
+    ap.add_argument("--redownload",     action="store_true")
     ap.add_argument("--download-only",  action="store_true")
     ap.add_argument("--preprocess-only",action="store_true")
     ap.add_argument("--forecast-only",  action="store_true")
@@ -391,43 +408,65 @@ def main():
     if args.download_only or args.run_all:
         download_year_range(args.start, args.end, bbox,
                             force=args.redownload)
+        # If this is *only* a download run, stop here.
+        if args.download_only and not args.run_all:
+            return
 
     # 2) Build seasonal series
     season = preprocess(bbox)
 
-    # 3) Try to add climate drivers, but soft-skip if files missing
-    nino_file = Path("data/raw/nino34.long.anom.csv")
-    dmi_file  = Path("data/raw/dmi.had.long.csv")
+    # 3) Add climate drivers if available (ENSO / IOD, including Aug–Sep)
+    nino_file = DATA_DIR / "nino34.long.anom.csv"
+    dmi_file  = DATA_DIR / "dmi.had.long.csv"
 
     if nino_file.exists() and dmi_file.exists():
+        # fetch_climate_drivers should now also return nino34_AS / dmi_AS
         drv = fetch_climate_drivers(nino_file, dmi_file)
         season = season.merge(drv, on="year", how="left")
 
-        season['nino34_L1'] = season['nino34'].shift(1)
-        season['dmi_L1']    = season['dmi'].shift(1)
+        # Aug–Sep 1-year lag (optional extra predictors)
+        season['nino34_AS_L1'] = season['nino34_AS'].shift(1)
+        season['dmi_AS_L1']    = season['dmi_AS'].shift(1)
 
-        corr = (
-            season[["total_mm", "nino34", "dmi"]]
-            .corr()
-            .loc[["nino34", "dmi"], "total_mm"]
-        )
+        cols_for_corr = [
+            "total_mm",      # OND seasonal rainfall
+            "nino34", "dmi",               # OND-season means (lag 0)
+            "nino34_AS", "dmi_AS",         # Aug–Sep lead
+            "nino34_AS_L1", "dmi_AS_L1"    # Aug–Sep of previous year
+        ]
 
-        print(f"Lag-0 correlations with {SEASON_CODE} total "
+        # Drop rows with all-NaN predictors to avoid degenerate corr matrices
+        corr_df = season[cols_for_corr].dropna(subset=["total_mm"])
+
+        corr = corr_df.corr().loc[
+            ["nino34", "dmi", "nino34_AS", "dmi_AS",
+             "nino34_AS_L1", "dmi_AS_L1"],
+            "total_mm"
+        ]
+
+        print(f"Lag/lead correlations with {SEASON_CODE} total "
               f"({season.year.min()}–{season.year.max()}*)")
         print(corr.round(2))
     else:
         print("⚠️ ENSO/IOD driver CSVs not found – skipping teleconnection "
-              "diagnostics (nino34 / DMI).")
+              "diagnostics (nino34 / DMI, Aug–Sep signals).")
 
+    # 4) Save merged dataset (with whatever columns are available)
     season.to_csv(
         PROC_DIR / f"{SEASON_CODE.lower()}_season_totals_with_drivers.csv",
         index=False
     )
 
+    # 5) Misc utilities / exits
     if args.audit_missing:
         audit_missing_season()
+        return
+
+    if args.preprocess_only and not args.run_all:
+        # We've already done preprocessing + teleconnections + CSV output
         return 
 
+    # 6) Optional modules
     if args.run_all or args.plot_only:
         plot_season(season)
 
@@ -440,7 +479,9 @@ def main():
     if args.run_all or args.classify_only:
         classify(season)
 
+    # 7) Trend diagnostics
     trend_test(season)
+
 
 if __name__ == "__main__":
     main()
